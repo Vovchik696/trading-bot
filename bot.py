@@ -2,8 +2,6 @@ import os
 import asyncio
 import aiohttp
 from datetime import datetime
-from telegram import Bot
-from telegram.ext import Application, CommandHandler
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -11,11 +9,14 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 SYMBOLS = ["DOGEUSDT", "BTCUSDT", "ETHUSDT"]
 
-auto_task = None
+async def send_telegram(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    async with aiohttp.ClientSession() as session:
+        await session.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
 
-async def get_candles(symbol: str, interval: str = "5m", limit: int = 50):
+async def get_candles(symbol):
     url = "https://fapi.binance.com/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    params = {"symbol": symbol, "interval": "5m", "limit": 20}
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params=params) as resp:
             data = await resp.json()
@@ -31,105 +32,108 @@ async def get_candles(symbol: str, interval: str = "5m", limit: int = 50):
                 })
             return candles
 
-async def analyze_with_claude(symbol: str, candles: list):
-    recent = candles[-20:]
-    current_price = recent[-1]["close"]
+async def analyze(symbol, candles):
+    current = candles[-1]["close"]
+    candle_text = "\n".join([f"{c['time']} O:{c['open']} H:{c['high']} L:{c['low']} C:{c['close']}" for c in candles])
     
-    candle_text = ""
-    for c in recent:
-        candle_text += f"{c['time']} O:{c['open']} H:{c['high']} L:{c['low']} C:{c['close']} V:{c['volume']:.0f}\n"
-    
-    prompt = f"""Ты опытный скальп трейдер. Анализируй {symbol} фьючерсы.
+    prompt = f"""Ты опытный скальп трейдер. Анализируй {symbol}.
 
-Последние 20 свечей (5 минут):
+Свечи 5м:
 {candle_text}
 
-Текущая цена: {current_price}
+Цена: {current}
 
-Дай краткий анализ:
-1. BIAS: ЛОНГ или ШОРТ или НЕЙТРАЛЬНО
-2. Ключевые уровни поддержки и сопротивления
-3. Точка входа
-4. Стоп-лосс
-5. Тейк-профит
-6. Что делать прямо сейчас
+Дай анализ:
+1. BIAS: ЛОНГ/ШОРТ/НЕЙТРАЛЬНО
+2. Поддержка и сопротивление
+3. Вход, стоп, тейк
+4. Что делать сейчас
 
-Отвечай коротко и чётко."""
+Коротко и чётко."""
 
     headers = {
         "Content-Type": "application/json",
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01"
     }
-    
     body = {
         "model": "claude-sonnet-4-20250514",
         "max_tokens": 1000,
         "messages": [{"role": "user", "content": prompt}]
     }
-    
     async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=headers,
-            json=body
-        ) as resp:
+        async with session.post("https://api.anthropic.com/v1/messages", headers=headers, json=body) as resp:
             data = await resp.json()
             return data["content"][0]["text"]
 
-async def send_analysis(symbol: str):
-    try:
-        candles = await get_candles(symbol)
-        analysis = await analyze_with_claude(symbol, candles)
-        current_price = candles[-1]["close"]
-        time_now = datetime.now().strftime("%H:%M")
-        message = f"📊 *{symbol}* | {time_now}\n💰 Цена: {current_price}\n\n{analysis}\n\n---"
-        bot = Bot(token=TELEGRAM_TOKEN)
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
-    except Exception as e:
-        print(f"Ошибка {symbol}: {e}")
+async def process_update(update):
+    message = update.get("message", {})
+    text = message.get("text", "")
+    chat_id = message.get("chat", {}).get("id")
+    
+    if not text or not chat_id:
+        return
+    
+    if text == "/start":
+        await send_telegram("👋 Привет! Я торговый бот.\n\n/analyze — анализ рынка\n/auto — каждые 5 минут\n/stop — остановить")
+    
+    elif text == "/analyze":
+        await send_telegram("🔍 Анализирую...")
+        for symbol in SYMBOLS:
+            candles = await get_candles(symbol)
+            analysis = await analyze(symbol, candles)
+            current = candles[-1]["close"]
+            time_now = datetime.now().strftime("%H:%M")
+            await send_telegram(f"📊 *{symbol}* | {time_now}\n💰 {current}\n\n{analysis}")
+            await asyncio.sleep(2)
 
-async def analyze_command(update, context):
-    await update.message.reply_text("🔍 Анализирую рынок...")
-    for symbol in SYMBOLS:
-        await send_analysis(symbol)
-        await asyncio.sleep(2)
+auto_running = False
 
-async def start_command(update, context):
-    await update.message.reply_text(
-        "👋 Привет! Я торговый бот.\n\n"
-        "Команды:\n"
-        "/analyze — анализ прямо сейчас\n"
-        "/auto — автоанализ каждые 5 минут\n"
-        "/stop — остановить автоанализ"
-    )
+async def auto_loop():
+    global auto_running
+    while auto_running:
+        for symbol in SYMBOLS:
+            if not auto_running:
+                break
+            candles = await get_candles(symbol)
+            analysis = await analyze(symbol, candles)
+            current = candles[-1]["close"]
+            time_now = datetime.now().strftime("%H:%M")
+            await send_telegram(f"📊 *{symbol}* | {time_now}\n💰 {current}\n\n{analysis}")
+            await asyncio.sleep(2)
+        await asyncio.sleep(300)
 
-async def auto_command(update, context):
-    global auto_task
-    await update.message.reply_text("✅ Автоанализ запущен! Каждые 5 минут.")
-    async def loop():
-        while True:
-            for symbol in SYMBOLS:
-                await send_analysis(symbol)
-                await asyncio.sleep(2)
-            await asyncio.sleep(300)
-    auto_task = asyncio.create_task(loop())
-
-async def stop_command(update, context):
-    global auto_task
-    if auto_task:
-        auto_task.cancel()
-        auto_task = None
-    await update.message.reply_text("⛔ Автоанализ остановлен.")
-
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("analyze", analyze_command))
-    app.add_handler(CommandHandler("auto", auto_command))
-    app.add_handler(CommandHandler("stop", stop_command))
+async def main():
+    global auto_running
+    offset = 0
     print("Бот запущен!")
-    app.run_polling(drop_pending_updates=True)
+    await send_telegram("🤖 Бот запущен и готов к работе!")
+    
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params={"offset": offset, "timeout": 30}) as resp:
+                    data = await resp.json()
+                    updates = data.get("result", [])
+                    
+                    for update in updates:
+                        offset = update["update_id"] + 1
+                        message = update.get("message", {})
+                        text = message.get("text", "")
+                        
+                        if text == "/auto" and not auto_running:
+                            auto_running = True
+                            await send_telegram("✅ Автоанализ запущен! Каждые 5 минут.")
+                            asyncio.create_task(auto_loop())
+                        elif text == "/stop":
+                            auto_running = False
+                            await send_telegram("⛔ Автоанализ остановлен.")
+                        else:
+                            await process_update(update)
+        except Exception as e:
+            print(f"Ошибка: {e}")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
