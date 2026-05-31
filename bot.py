@@ -1,22 +1,20 @@
 import os
 import asyncio
 import aiohttp
-import json
 from datetime import datetime
 from telegram import Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CommandHandler
 
-# Настройки
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Монеты для анализа
 SYMBOLS = ["DOGEUSDT", "BTCUSDT", "ETHUSDT"]
 
+auto_task = None
+
 async def get_candles(symbol: str, interval: str = "5m", limit: int = 50):
-    """Получаем свечи с Binance"""
-    url = f"https://fapi.binance.com/fapi/v1/klines"
+    url = "https://fapi.binance.com/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params=params) as resp:
@@ -34,9 +32,6 @@ async def get_candles(symbol: str, interval: str = "5m", limit: int = 50):
             return candles
 
 async def analyze_with_claude(symbol: str, candles: list):
-    """Отправляем данные Клоду для анализа"""
-    
-    # Формируем последние 20 свечей для анализа
     recent = candles[-20:]
     current_price = recent[-1]["close"]
     
@@ -44,7 +39,7 @@ async def analyze_with_claude(symbol: str, candles: list):
     for c in recent:
         candle_text += f"{c['time']} O:{c['open']} H:{c['high']} L:{c['low']} C:{c['close']} V:{c['volume']:.0f}\n"
     
-    prompt = f"""Ты опытный скальп трейдер. Анализируй данные фьючерсов {symbol}.
+    prompt = f"""Ты опытный скальп трейдер. Анализируй {symbol} фьючерсы.
 
 Последние 20 свечей (5 минут):
 {candle_text}
@@ -57,9 +52,9 @@ async def analyze_with_claude(symbol: str, candles: list):
 3. Точка входа
 4. Стоп-лосс
 5. Тейк-профит
-6. Одна фраза — что делать прямо сейчас
+6. Что делать прямо сейчас
 
-Отвечай коротко и чётко. Только цифры и факты."""
+Отвечай коротко и чётко."""
 
     headers = {
         "Content-Type": "application/json",
@@ -83,39 +78,24 @@ async def analyze_with_claude(symbol: str, candles: list):
             return data["content"][0]["text"]
 
 async def send_analysis(symbol: str):
-    """Получаем и отправляем анализ в Telegram"""
     try:
         candles = await get_candles(symbol)
         analysis = await analyze_with_claude(symbol, candles)
-        
         current_price = candles[-1]["close"]
         time_now = datetime.now().strftime("%H:%M")
-        
-        message = f"""📊 *{symbol}* | {time_now}
-💰 Цена: {current_price}
-
-{analysis}
-
----"""
-        
+        message = f"📊 *{symbol}* | {time_now}\n💰 Цена: {current_price}\n\n{analysis}\n\n---"
         bot = Bot(token=TELEGRAM_TOKEN)
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=message,
-            parse_mode="Markdown"
-        )
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
     except Exception as e:
         print(f"Ошибка {symbol}: {e}")
 
 async def analyze_command(update, context):
-    """Команда /analyze — анализ по запросу"""
     await update.message.reply_text("🔍 Анализирую рынок...")
     for symbol in SYMBOLS:
         await send_analysis(symbol)
         await asyncio.sleep(2)
 
 async def start_command(update, context):
-    """Команда /start"""
     await update.message.reply_text(
         "👋 Привет! Я торговый бот.\n\n"
         "Команды:\n"
@@ -124,24 +104,18 @@ async def start_command(update, context):
         "/stop — остановить автоанализ"
     )
 
-auto_task = None
-
 async def auto_command(update, context):
-    """Команда /auto — запуск автоанализа"""
     global auto_task
     await update.message.reply_text("✅ Автоанализ запущен! Каждые 5 минут.")
-    
     async def loop():
         while True:
             for symbol in SYMBOLS:
                 await send_analysis(symbol)
                 await asyncio.sleep(2)
-            await asyncio.sleep(300)  # 5 минут
-    
+            await asyncio.sleep(300)
     auto_task = asyncio.create_task(loop())
 
 async def stop_command(update, context):
-    """Команда /stop"""
     global auto_task
     if auto_task:
         auto_task.cancel()
@@ -155,7 +129,7 @@ def main():
     app.add_handler(CommandHandler("auto", auto_command))
     app.add_handler(CommandHandler("stop", stop_command))
     print("Бот запущен!")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
